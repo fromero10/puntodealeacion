@@ -1,4 +1,9 @@
-# Autocut — automatic silence and filler cutting (3 cameras, 1 audio)
+# Punto de aleación — automation tools
+
+Repo for all Punto de aleación automation. Tools:
+- `autocut.py` — cut silences and filler words across 3 cameras (below)
+
+## Autocut — automatic silence and filler cutting (3 cameras, 1 audio)
 
 Tool for the Punto de aleación workflow: you record with 3 cameras and one
 good audio source (the "master"). The script detects silences and filler words

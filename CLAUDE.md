@@ -1,4 +1,4 @@
-# Autocut (code repo)
+# Punto de aleación (code repo)
 
 Code lives here; project docs live in Google Drive so Nano (Instinct) can read them.
 
