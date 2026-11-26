@@ -21,6 +21,9 @@ import shutil
 import subprocess
 import sys
 import wave
+from fractions import Fraction
+from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 import numpy as np
 
@@ -56,8 +59,36 @@ def media_info(path):
         if fps <= 0:
             fps = 25.0
         w, h = v.get("width"), v.get("height")
+        rot = next((abs(int(sd.get("rotation", 0))) for sd in v.get("side_data_list", [])
+                    if "rotation" in sd), 0)
+        if rot in (90, 270):
+            w, h = h, w
+    rate = snap_rate(fps)
+    # camera timecode (e.g. Blackmagic Camera app); plain iPhone files have none
+    tcs = [j["format"].get("tags", {}).get("timecode")] + \
+          [s.get("tags", {}).get("timecode") for s in streams]
+    tc_str = next((t for t in tcs if t), None)
     return {"duration": dur, "has_audio": a is not None, "has_video": v is not None,
-            "fps": fps, "width": w, "height": h}
+            "fps": fps, "rate": rate, "width": w, "height": h,
+            "tc_start": parse_timecode(tc_str, rate) if tc_str else Fraction(0),
+            "audio_channels": int(a.get("channels", 2)) if a else 0,
+            "audio_rate": int(a.get("sample_rate", 48000)) if a else 0}
+
+
+# Standard frame rates as (num, den). Phones record variable frame rate; we
+# snap the average to the nearest standard so FCPXML times land on frames.
+STANDARD_RATES = [(24000, 1001), (24, 1), (25, 1), (30000, 1001), (30, 1),
+                  (50, 1), (60000, 1001), (60, 1)]
+
+
+def snap_rate(fps):
+    return min(STANDARD_RATES, key=lambda r: abs(r[0] / r[1] - fps))
+
+
+def parse_timecode(tc_str, rate):
+    h, m, s, f = [int(x) for x in re.split(r"[:;.]", tc_str)]
+    nominal = int(round(rate[0] / rate[1]))
+    return Fraction(((h * 60 + m) * 60 + s) * nominal + f) * Fraction(rate[1], rate[0])
 
 
 def extract_wav(src, dst, seconds=None):
@@ -130,8 +161,15 @@ def transcribe(master_file, model_size, cache_path):
     from faster_whisper import WhisperModel
     print("  loading whisper model '%s' (downloads on first run)..." % model_size, flush=True)
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    segs, _ = model.transcribe(master_file, language="es", word_timestamps=True,
-                               vad_filter=True)
+    # decode with ffmpeg ourselves: faster-whisper's own decoder breaks on newer PyAV
+    wav = (cache_path or master_file) + ".16k.wav"
+    extract_wav(master_file, wav)
+    audio = load_wav(wav)
+    os.remove(wav)
+    # Whisper tends to drop disfluencies; a prompt full of them makes it keep "eh"
+    segs, _ = model.transcribe(audio, language="es", word_timestamps=True,
+                               vad_filter=True,
+                               initial_prompt="Eh, bueno, eh... mmm, o sea, eh, sí, ehh.")
     words = []
     for seg in segs:
         for w in (seg.words or []):
@@ -146,11 +184,16 @@ def transcribe(master_file, model_size, cache_path):
 FILLER_NORMALIZE = str.maketrans("", "", ".,;:!?\"'()[]{}…")
 
 
+def collapse(word):
+    """'Eeehhh,' -> 'eh', 'mmm' -> 'm': matches any stretched spelling."""
+    return re.sub(r"(.)\1+", r"\1", word.strip().lower().translate(FILLER_NORMALIZE))
+
+
 def find_fillers(words, fillers):
-    fillers = {f.lower() for f in fillers}
+    fillers = {collapse(f) for f in fillers}
     hits = []
     for w in words:
-        t = w["word"].strip().lower().translate(FILLER_NORMALIZE)
+        t = collapse(w["word"])
         if t in fillers:
             hits.append((w["start"], w["end"], t))
     return hits
@@ -255,7 +298,7 @@ def render_master_audio(master_path, kept, out_path):
 
 # ---------------------------------------------------------------- exports
 
-def tc(sec, fps=25):
+def tc(sec, fps):
     f = int(round(sec * fps))
     fr = f % int(round(fps))
     s = (f // int(round(fps))) % 60
@@ -264,51 +307,119 @@ def tc(sec, fps=25):
     return "%02d:%02d:%02d:%02d" % (h, m, s, fr)
 
 
-def write_edl(path, title, clip_name, segs_cam_time):
+def write_edl(path, title, clip_name, segs_cam_time, fps):
     with open(path, "w") as f:
         f.write("TITLE: %s\nFCM: NON-DROP FRAME\n\n" % title)
         rec = 0.0
         for i, (cs, ce) in enumerate(segs_cam_time):
             d = ce - cs
             f.write("%03d  AX       V     C        %s %s %s %s\n"
-                    % (i + 1, tc(cs), tc(ce), tc(rec), tc(rec + d)))
+                    % (i + 1, tc(cs, fps), tc(ce, fps), tc(rec, fps), tc(rec + d, fps)))
             f.write("* FROM CLIP NAME: %s\n\n" % clip_name)
             rec += d
 
 
-def fcpxml_time(sec):
-    ms = int(round(sec * 1000))
-    return "%d/1000s" % ms
+def fcpxml_time(t):
+    t = Fraction(t)
+    return "0s" if t == 0 else "%d/%ds" % (t.numerator, t.denominator)
 
 
-def write_fcpxml(path, project, cam_file, segs_cam_time, total_dur):
-    abs_src = os.path.abspath(cam_file)
-    lines = []
-    lines.append('<?xml version="1.0" encoding="UTF-8"?>')
-    lines.append('<!DOCTYPE fcpxml>')
-    lines.append('<fcpxml version="1.9">')
-    lines.append(' <resources>')
-    lines.append('  <format id="r1" name="FFVideoFormat1080p25" frameDuration="1/25s" width="1920" height="1080"/>')
-    lines.append('  <asset id="r2" name="%s" src="file://%s" start="0s" duration="%s" hasVideo="1" hasAudio="1" format="r1"/>'
-                 % (os.path.basename(cam_file), abs_src, fcpxml_time(segs_cam_time[-1][1] if segs_cam_time else total_dur)))
-    lines.append(' </resources>')
-    lines.append(' <library>')
-    lines.append('  <event name="autocut">')
-    lines.append('   <project name="%s">' % project)
-    lines.append('    <sequence format="r1" duration="%s">' % fcpxml_time(total_dur))
-    lines.append('     <spine>')
-    off = 0.0
-    for (cs, ce) in segs_cam_time:
-        d = ce - cs
-        lines.append('      <asset-clip ref="r2" offset="%s" start="%s" duration="%s"/>'
-                     % (fcpxml_time(off), fcpxml_time(cs), fcpxml_time(d)))
-        off += d
-    lines.append('     </spine>')
-    lines.append('    </sequence>')
-    lines.append('   </project>')
-    lines.append('  </event>')
-    lines.append(' </library>')
-    lines.append('</fcpxml>')
+def to_frames(sec, frame):
+    """Snap seconds to a whole number of frames; returns Fraction seconds."""
+    return Fraction(int(round(Fraction(sec) / frame))) * frame
+
+
+def write_fcpxml(path, project, tracks, kept, master_audio=None):
+    """One Final Cut timeline with every camera stacked, all cut identically.
+
+    tracks: list of dicts {file, info, offset, muted}; tracks[0] is the main
+    (spine) camera, the rest are connected clips in lanes 1, 2, ... above it.
+    kept: kept segments in master time.
+    master_audio: optional {file, info} when the master is a separate audio
+    file; it goes in lane -1 and every camera is muted.
+    """
+    main = tracks[0]["info"]
+    frame = Fraction(main["rate"][1], main["rate"][0])
+    res, fmt_ids, lines = [], {}, []
+
+    def fmt_id(info):
+        key = (info["width"], info["height"], info["rate"])
+        if key not in fmt_ids:
+            fmt_ids[key] = "r%d" % (len(fmt_ids) + 1)
+            res.append('  <format id="%s" frameDuration="%s" width="%d" height="%d"/>'
+                       % (fmt_ids[key], fcpxml_time(Fraction(info["rate"][1], info["rate"][0])),
+                          info["width"] or 1920, info["height"] or 1080))
+        return fmt_ids[key]
+
+    for t in tracks:
+        fmt_id(t["info"])
+    items = tracks + ([master_audio] if master_audio else [])
+    for i, t in enumerate(items):
+        info = t["info"]
+        t["id"] = "a%d" % (i + 1)
+        attrs = 'id="%s" name=%s start="%s" duration="%s"' % (
+            t["id"], quoteattr(os.path.basename(t["file"])),
+            fcpxml_time(info["tc_start"]), fcpxml_time(to_frames(info["duration"], frame)))
+        if info["has_video"]:
+            attrs += ' hasVideo="1" format="%s"' % fmt_id(info)
+        if info["has_audio"]:
+            attrs += ' hasAudio="1" audioSources="1" audioChannels="%d" audioRate="%d"' % (
+                info["audio_channels"], info["audio_rate"])
+        res.append('  <asset %s>' % attrs)
+        res.append('   <media-rep kind="original-media" src=%s/>'
+                   % quoteattr(Path(t["file"]).resolve().as_uri()))
+        res.append('  </asset>')
+
+    def clip_bounds(t, ms, me):
+        """Clip [ms, me] (master time) to the file; returns (shift, start, dur) or None."""
+        info = t["info"]
+        s, e = ms + t.get("offset", 0.0), me + t.get("offset", 0.0)
+        shift = max(0.0, -s)
+        s, e = max(0.0, s), min(info["duration"], e)
+        dur = to_frames(e - s, frame)
+        if dur < 5 * frame:  # skip slivers where a camera starts/stops mid-segment
+            return None
+        return to_frames(shift, frame), info["tc_start"] + to_frames(s, frame), dur
+
+    def clip_xml(t, offset, start, dur, lane=None, children=()):
+        open_tag = '<asset-clip ref="%s"%s offset="%s" start="%s" duration="%s" name=%s' % (
+            t["id"], ' lane="%d"' % lane if lane is not None else "",
+            fcpxml_time(offset), fcpxml_time(start), fcpxml_time(dur),
+            quoteattr(os.path.splitext(os.path.basename(t["file"]))[0]))
+        inner = (['<adjust-volume amount="-96dB"/>'] if t.get("muted") else []) + list(children)
+        if not inner:
+            return [open_tag + "/>"]
+        return [open_tag + ">"] + ["  " + c for c in inner] + ["</asset-clip>"]
+
+    cursor = Fraction(0)
+    spine = []
+    for (ms, me) in kept:
+        b = clip_bounds(tracks[0], ms, me)
+        if not b:
+            continue
+        _, pstart, pdur = b
+        children = []
+        for lane, t in enumerate(tracks[1:], start=1):
+            cb = clip_bounds(t, ms, me)
+            if cb:
+                shift, cstart, cdur = cb
+                children += clip_xml(t, pstart + shift, cstart, min(cdur, pdur - shift), lane)
+        if master_audio:
+            cb = clip_bounds(master_audio, ms, me)
+            if cb:
+                shift, cstart, cdur = cb
+                children += clip_xml(master_audio, pstart + shift, cstart, min(cdur, pdur - shift), -1)
+        spine += clip_xml(tracks[0], cursor, pstart, pdur, children=children)
+        cursor += pdur
+
+    lines += ['<?xml version="1.0" encoding="UTF-8"?>', '<!DOCTYPE fcpxml>',
+              '<fcpxml version="1.9">', ' <resources>'] + res + [' </resources>']
+    lines += [' <library>', '  <event name="Punto de aleación">',
+              '   <project name=%s>' % quoteattr(project),
+              '    <sequence format="%s" duration="%s" tcStart="0s" tcFormat="NDF" audioLayout="stereo" audioRate="48k">'
+              % (fmt_id(main), fcpxml_time(cursor)),
+              '     <spine>'] + ["      " + l for l in spine]
+    lines += ['     </spine>', '    </sequence>', '   </project>', '  </event>', ' </library>', '</fcpxml>']
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -325,22 +436,25 @@ def main():
                     help="'auto' (default) or comma list like cam1.mp4=2.5,cam2.mp4=-1.0 (cam_time = master_time + offset)")
     ap.add_argument("--sync-window", type=float, default=300,
                     help="seconds from the start used for auto sync (default 300)")
-    ap.add_argument("--min-silence", type=float, default=0.7,
-                    help="minimum silence length to cut, seconds (default 0.7)")
+    ap.add_argument("--min-silence", type=float, default=0.8,
+                    help="minimum silence length to cut, seconds (default 0.8)")
     ap.add_argument("--silence-threshold", type=float, default=-35,
                     help="silence threshold in dB (default -35)")
-    ap.add_argument("--keep-gap", type=float, default=0.25,
-                    help="silence padding kept on each side, seconds (default 0.25)")
-    ap.add_argument("--fillers", default="eh,este,em,mmm,ehm,uh,um",
-                    help="comma-separated filler words to cut (Spanish default)")
+    ap.add_argument("--keep-gap", type=float, default=0.35,
+                    help="silence padding kept on each side so the video breathes, seconds (default 0.35)")
+    ap.add_argument("--fillers", default="eh,em,mm",
+                    help="comma-separated filler words to cut; stretched spellings match too "
+                         "(eh = eeh = ehhh). Default: eh,em,mm")
     ap.add_argument("--filler-pad", type=float, default=0.06,
                     help="seconds of padding around a filler word (default 0.06)")
     ap.add_argument("--whisper-model", default="small",
                     help="whisper model size: tiny, base, small, medium (default small)")
     ap.add_argument("--no-whisper", action="store_true", help="skip filler-word detection")
-    ap.add_argument("--export", default="both", choices=["fcpxml", "edl", "both", "none"],
-                    help="timeline export format(s), default both. FCPXML imports into DaVinci Resolve and Premiere.")
-    ap.add_argument("--no-render", action="store_true", help="only compute cuts and exports, skip video rendering")
+    ap.add_argument("--export", default="fcpxml", choices=["fcpxml", "edl", "both", "none"],
+                    help="timeline export: fcpxml (default, one Final Cut timeline with all cameras stacked), "
+                         "edl (one per camera), both, none")
+    ap.add_argument("--render", action="store_true",
+                    help="also render cut MP4 previews per camera and the cut master audio (slow)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -417,25 +531,35 @@ def main():
             "offsets": {os.path.basename(c): round(o, 4) for c, o in offsets.items()},
         }, f, indent=2, ensure_ascii=False)
 
-    # ---- master audio cut
-    print("rendering cut master audio...", flush=True)
-    render_master_audio(args.master, kept, os.path.join(args.out, "master_audio_cut.wav"))
+    # ---- Final Cut timeline: master camera on the spine, others stacked above, muted
+    if args.export in ("fcpxml", "both"):
+        master_abs = os.path.abspath(args.master)
+        main_cam = next((c for c in args.cams if os.path.abspath(c) == master_abs), args.cams[0])
+        master_is_cam = os.path.abspath(main_cam) == master_abs
+        order = [main_cam] + [c for c in args.cams if c != main_cam]
+        tracks = [{"file": c, "info": cam_infos[c], "offset": offsets[c],
+                   "muted": not (master_is_cam and c == main_cam)} for c in order]
+        master_audio = None if master_is_cam else {"file": args.master, "info": minfo, "offset": 0.0}
+        project = os.path.splitext(os.path.basename(args.master))[0] + "_autocut"
+        out_xml = os.path.join(args.out, project + ".fcpxml")
+        write_fcpxml(out_xml, project, tracks, kept, master_audio)
+        print("final cut timeline: %s" % out_xml, flush=True)
 
-    # ---- cameras
+    if args.render:
+        print("rendering cut master audio...", flush=True)
+        render_master_audio(args.master, kept, os.path.join(args.out, "master_audio_cut.wav"))
+
+    # ---- per-camera EDLs and previews
     for cam in args.cams:
         base = os.path.splitext(os.path.basename(cam))[0]
         ci = cam_infos[cam]
         off = offsets[cam]
         segs_cam = [(max(0.0, s + off), min(ci["duration"], e + off)) for s, e in kept]
         segs_cam = [(s, e) for s, e in segs_cam if e - s >= 0.08]
-        total = sum(e - s for s, e in segs_cam)
         if args.export in ("edl", "both"):
             write_edl(os.path.join(args.out, base + "_cut.edl"), base + "_cut",
-                      os.path.basename(cam), segs_cam)
-        if args.export in ("fcpxml", "both"):
-            write_fcpxml(os.path.join(args.out, base + "_cut.fcpxml"), base + "_cut",
-                         cam, segs_cam, total)
-        if not args.no_render:
+                      os.path.basename(cam), segs_cam, ci["fps"])
+        if args.render:
             print("rendering %s (%d segments)..." % (base, len(segs_cam)), flush=True)
             render_camera(cam, ci, kept, off, args.out, base)
     print("done. outputs in %s" % os.path.abspath(args.out), flush=True)

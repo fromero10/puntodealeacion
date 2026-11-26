@@ -16,32 +16,24 @@ call in the edit.
 1. **Syncs each camera to the master audio** by comparing waveforms (uses each
    camera's scratch audio, even a bad built-in mic). No clap needed if the
    cameras record their own audio.
-2. **Detects long silences** in the master audio (default: over 0.7 s below
-   -35 dB) and trims them, keeping 0.25 s of breathing room on each side so the
-   pacing survives.
+2. **Detects long silences** in the master audio (default: over 0.8 s below
+   -35 dB) and trims them, keeping 0.35 s of breathing room on each side so the
+   video still breathes.
 3. **Detects filler words** by transcribing the audio with Whisper (Spanish)
-   and cutting "eh", "este", "em", "mmm", "ehm", "uh", "um". The list is
-   configurable.
-4. **Applies the same cut list to all 3 cameras** and produces:
-   - `camX_cut.mp4` — each camera already cut (video + its scratch audio)
-   - `master_audio_cut.wav` — the good audio, cut the same way
-   - `camX_cut.fcpxml` — importable timeline for DaVinci Resolve and Premiere
-     (references the original files, no re-encoding)
-   - `camX_cut.edl` — same thing in EDL format (universal fallback)
-   - `cuts.json` — the exact cut list, in case you want to adjust by hand
+   and cutting "eh", "em", "mm". Stretched spellings match too ("eeeh",
+   "mmmm"). The list is configurable.
+4. **Builds one Final Cut Pro timeline** (`<master>_autocut.fcpxml`): the
+   master camera on the main track, the other cameras stacked above it, all
+   synced and cut at the same points, their scratch audio muted. It references
+   the original files: no re-encoding, no quality loss.
+5. Also writes `cuts.json` (the exact cut list) and `transcript.json`.
 
-## Install (one time)
-
-You need a computer with:
-
-1. **Python 3.9+** — https://www.python.org/downloads/
-2. **ffmpeg** —
-   - Windows: download from https://www.gyan.dev/ffmpeg/builds/ and add `ffmpeg.exe` and `ffprobe.exe` to your PATH
-   - Mac: `brew install ffmpeg`
-3. **Python dependencies**: in a terminal, inside this folder:
+## Install (one time, Mac)
 
 ```
-pip install -r requirements.txt
+brew install ffmpeg python@3.12
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
 The first run downloads the Whisper model (a few hundred MB, one time only).
@@ -49,56 +41,58 @@ Everything runs locally; your video never leaves your computer.
 
 ## Usage
 
+The usual case: the mics are plugged into one of the cameras, so that camera
+is the master.
+
 ```
-python3 autocut.py --master master_audio.wav --cams cam1.mp4 cam2.mp4 cam3.mp4 --out output/
+.venv/bin/python autocut.py --master camA.mov --cams camA.mov camB.mov camC.mov --out output/
 ```
 
-- `--master`: the good audio file (.wav, .mp3, or even a video whose audio is the good one).
-- `--cams`: the 3 camera videos.
+- `--master`: the file with the good audio. A camera video (recommended, it
+  becomes the main track) or a separate audio file (it goes on its own track
+  below and all cameras are muted).
+- `--cams`: the camera videos.
 - `--out`: folder for the results.
 
-For a ~20 minute video, expect several minutes of processing (transcription is
+For a ~1 hour episode, expect several minutes of processing (transcription is
 the slow part; normal on CPU).
 
 ### Useful options
 
 | Option | What it does | Default |
 |---|---|---|
-| `--min-silence 0.9` | only cut silences longer than this | 0.7 s |
+| `--min-silence 1.0` | only cut silences longer than this | 0.8 s |
 | `--silence-threshold -40` | silence threshold (dB). Lower it if there's background noise | -35 |
-| `--keep-gap 0.4` | breathing room kept on each side of a cut | 0.25 s |
-| `--fillers "eh,mmm"` | filler words to cut | eh,este,em,mmm,ehm,uh,um |
+| `--keep-gap 0.5` | breathing room kept on each side of a cut | 0.35 s |
+| `--fillers "eh,mm"` | filler words to cut | eh,em,mm |
 | `--whisper-model medium` | more accurate model (slower); `tiny`/`base` are faster | small |
 | `--no-whisper` | cut silences only, no fillers | — |
-| `--no-render` | skip the cut MP4s, timelines only | — |
-| `--offsets cam2.mp4=1.5` | manual sync if auto-sync fails | auto |
+| `--export edl` / `both` | per-camera EDLs for other editors | fcpxml |
+| `--render` | also render cut MP4 previews and cut master audio (slow) | off |
+| `--offsets camB.mov=1.5` | manual sync if auto-sync fails | auto |
 
 ### If auto-sync fails
 
 The script reports a confidence for each sync. If you see "LOW CONFIDENCE" or a
-camera recorded no audio of its own, do a clap or a visible/audible tap at the
-start of the recording and pass the offset manually:
-`--offsets cam2.mp4=2.35` (positive = the camera started recording 2.35 s
-before the master; find it by comparing the clap instant in both).
+camera recorded no audio of its own, do a clap at the start of the recording
+and pass the offset manually: `--offsets camB.mov=2.35` (positive = the camera
+started recording 2.35 s before the master).
 
-## Working with the result
+## Working with the result in Final Cut Pro
 
-**Recommended flow (best quality):** import the `.fcpxml` into DaVinci Resolve
-(File > Import > Timeline) or Premiere (File > Import). Each timeline
-references the camera's original file with the cuts already placed, no quality
-loss. Add `master_audio_cut.wav` as the main audio track, mute the scratch
-audio, and build your multicam on top.
-
-**Quick flow (preview):** the `camX_cut.mp4` files are already cut and ready to
-review or publish directly. Note: video can only cut on frame boundaries
-(~40 ms), so the MP4s can drift a fraction of a second from the audio over a
-long video. For the final master, use the timeline flow.
+1. File > Import > XML… and pick the `.fcpxml`. It creates an event
+   "Punto de aleación" with the project.
+2. If the files are on a different Mac than where autocut ran, Final Cut shows
+   them as missing: select the clips, File > Relink Files…, and point to your
+   copies (same file names).
+3. Edit as usual: cameras are stacked, already synced and cut; disable the
+   angles you don't want at each moment.
 
 ## Tips
 
-- If you cut "este", review the result: it's also a normal word ("este video").
-  If it produces false cuts, remove it from `--fillers`.
 - Don't cut every silence: a very low `--min-silence` makes the video feel
-  rushed. 0.7–1.0 s usually gives a natural pace.
-- `transcript.json` is saved in the output folder: re-runs with different
-  settings skip the transcription.
+  rushed. 0.8–1.0 s usually gives a natural pace.
+- Re-runs into the same output folder reuse `transcript.json` and skip the
+  transcription.
+- Phones record at a variable frame rate; the timeline snaps to the nearest
+  standard rate (30, 29.97, 60…). Check sync at the end of long episodes.
