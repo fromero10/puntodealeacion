@@ -334,7 +334,7 @@ def to_frames(sec, frame):
     return Fraction(int(round(Fraction(sec) / frame))) * frame
 
 
-def write_fcpxml(path, project, tracks, kept, master_audio=None):
+def write_fcpxml(path, project, tracks, kept, master_audio=None, timeline=None):
     """One Final Cut timeline with every camera stacked, all cut identically.
 
     tracks: list of dicts {file, info, offset, muted}; tracks[0] is the main
@@ -342,10 +342,14 @@ def write_fcpxml(path, project, tracks, kept, master_audio=None):
     kept: kept segments in master time.
     master_audio: optional {file, info} when the master is a separate audio
     file; it goes in lane -1 and every camera is muted.
+    timeline: {width, height, rate} of the project; default: the main camera's.
     """
-    main = tracks[0]["info"]
-    frame = Fraction(main["rate"][1], main["rate"][0])
+    main = timeline or tracks[0]["info"]
+    frame = Fraction(main["rate"][1], main["rate"][0])  # timeline frame
     res, fmt_ids, lines = [], {}, []
+
+    def src_frame(info):
+        return Fraction(info["rate"][1], info["rate"][0])
 
     def fmt_id(info):
         key = (info["width"], info["height"], info["rate"])
@@ -364,7 +368,7 @@ def write_fcpxml(path, project, tracks, kept, master_audio=None):
         t["id"] = "a%d" % (i + 1)
         attrs = 'id="%s" name=%s start="%s" duration="%s"' % (
             t["id"], quoteattr(os.path.basename(t["file"])),
-            fcpxml_time(info["tc_start"]), fcpxml_time(to_frames(info["duration"], frame)))
+            fcpxml_time(info["tc_start"]), fcpxml_time(to_frames(info["duration"], src_frame(info))))
         if info["has_video"]:
             attrs += ' hasVideo="1" format="%s"' % fmt_id(info)
         if info["has_audio"]:
@@ -384,7 +388,7 @@ def write_fcpxml(path, project, tracks, kept, master_audio=None):
         dur = to_frames(e - s, frame)
         if dur < 5 * frame:  # skip slivers where a camera starts/stops mid-segment
             return None
-        return to_frames(shift, frame), info["tc_start"] + to_frames(s, frame), dur
+        return to_frames(shift, frame), info["tc_start"] + to_frames(s, src_frame(info)), dur
 
     def clip_xml(t, offset, start, dur, lane=None, children=()):
         open_tag = '<asset-clip ref="%s"%s offset="%s" start="%s" duration="%s" name=%s' % (
@@ -429,6 +433,17 @@ def write_fcpxml(path, project, tracks, kept, master_audio=None):
         f.write("\n".join(lines) + "\n")
 
 
+def parse_timeline(spec):
+    """'1080p60' -> {width, height, rate}; 'master' -> None (use main camera)."""
+    if spec == "master":
+        return None
+    m = re.fullmatch(r"(\d+)p([\d.]+)", spec)
+    if not m:
+        raise SystemExit("--timeline must look like 1080p60 or be 'master'")
+    h = int(m.group(1))
+    return {"width": h * 16 // 9, "height": h, "rate": snap_rate(float(m.group(2)))}
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -441,12 +456,13 @@ def main():
                     help="'auto' (default) or comma list like cam1.mp4=2.5,cam2.mp4=-1.0 (cam_time = master_time + offset)")
     ap.add_argument("--sync-window", type=float, default=300,
                     help="seconds from the start used for auto sync (default 300)")
-    ap.add_argument("--min-silence", type=float, default=0.8,
-                    help="minimum silence length to cut, seconds (default 0.8)")
+    ap.add_argument("--min-silence", type=float, default=0.5,
+                    help="minimum silence length to cut, seconds (default 0.5)")
     ap.add_argument("--silence-threshold", type=float, default=-35,
                     help="silence threshold in dB (default -35)")
-    ap.add_argument("--keep-gap", type=float, default=0.35,
-                    help="silence padding kept on each side so the video breathes, seconds (default 0.35)")
+    ap.add_argument("--keep-gap", type=float, default=0.13,
+                    help="silence padding kept on each side so the video breathes, seconds (default 0.13; "
+                         "the editor leaves ~0.25 s per pause)")
     ap.add_argument("--fillers", default="eh,em,mm",
                     help="comma-separated filler words to cut; stretched spellings match too "
                          "(eh = eeh = ehhh). Default: eh,em,mm")
@@ -458,6 +474,9 @@ def main():
     ap.add_argument("--export", default="fcpxml", choices=["fcpxml", "edl", "both", "none"],
                     help="timeline export: fcpxml (default, one Final Cut timeline with all cameras stacked), "
                          "edl (one per camera), both, none")
+    ap.add_argument("--timeline", default="1080p60",
+                    help="Final Cut project format: 1080p60 (default, the editor's setting), "
+                         "e.g. 2160p24, 720p30, or 'master' to use the master camera's format")
     ap.add_argument("--render", action="store_true",
                     help="also render cut MP4 previews per camera and the cut master audio (slow)")
     args = ap.parse_args()
@@ -547,7 +566,7 @@ def main():
         master_audio = None if master_is_cam else {"file": args.master, "info": minfo, "offset": 0.0}
         project = os.path.splitext(os.path.basename(args.master))[0] + "_autocut"
         out_xml = os.path.join(args.out, project + ".fcpxml")
-        write_fcpxml(out_xml, project, tracks, kept, master_audio)
+        write_fcpxml(out_xml, project, tracks, kept, master_audio, parse_timeline(args.timeline))
         print("final cut timeline: %s" % out_xml, flush=True)
 
     if args.render:

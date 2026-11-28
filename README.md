@@ -16,9 +16,9 @@ call in the edit.
 1. **Syncs each camera to the master audio** by comparing waveforms (uses each
    camera's scratch audio, even a bad built-in mic). No clap needed if the
    cameras record their own audio.
-2. **Detects long silences** in the master audio (default: over 0.8 s below
-   -35 dB) and trims them, keeping 0.35 s of breathing room on each side so the
-   video still breathes.
+2. **Detects long silences** in the master audio (default: over 0.5 s below
+   -35 dB) and trims them, keeping 0.13 s of breathing room on each side (the
+   editor leaves ~0.25 s per pause).
 3. **Detects filler words** by transcribing the audio with Whisper (Spanish)
    and cutting "eh", "em", "mm". Stretched spellings match too ("eeeh",
    "mmmm"). The list is configurable.
@@ -61,9 +61,10 @@ the slow part; normal on CPU).
 
 | Option | What it does | Default |
 |---|---|---|
-| `--min-silence 1.0` | only cut silences longer than this | 0.8 s |
+| `--min-silence 0.8` | only cut silences longer than this | 0.5 s |
 | `--silence-threshold -40` | silence threshold (dB). Lower it if there's background noise | -35 |
-| `--keep-gap 0.5` | breathing room kept on each side of a cut | 0.35 s |
+| `--keep-gap 0.3` | breathing room kept on each side of a cut | 0.13 s |
+| `--timeline 2160p24` | Final Cut project format (`master` = master camera's) | 1080p60 |
 | `--fillers "eh,mm"` | filler words to cut | eh,em,mm |
 | `--whisper-model medium` | more accurate model (slower); `tiny`/`base` are faster | small |
 | `--no-whisper` | cut silences only, no fillers | — |
