@@ -63,7 +63,12 @@ def media_info(path):
                     if "rotation" in sd), 0)
         if rot in (90, 270):
             w, h = h, w
-    rate = snap_rate(fps)
+    # prefer the nominal rate (r_frame_rate): a phone's VFR average of 59.968
+    # would otherwise snap to 59.94 instead of 60
+    nominal = v.get("r_frame_rate", "0/1").split("/") if v else ["0", "1"]
+    nominal = float(nominal[0]) / float(nominal[1]) if float(nominal[1]) else 0
+    rate = next((r for r in STANDARD_RATES if abs(r[0] / r[1] - nominal) < 0.001), None) \
+        or snap_rate(fps)
     # camera timecode (e.g. Blackmagic Camera app); plain iPhone files have none
     tcs = [j["format"].get("tags", {}).get("timecode")] + \
           [s.get("tags", {}).get("timecode") for s in streams]
